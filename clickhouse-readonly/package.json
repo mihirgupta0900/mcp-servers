@@ -1,0 +1,18 @@
+{
+  "name": "clickhouse-readonly-mcp",
+  "version": "1.0.0",
+  "description": "Read-only ClickHouse MCP (prod/stag)",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@clickhouse/client": "^1.23.1",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.4.3"
+  }
+}

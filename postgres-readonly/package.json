@@ -1,0 +1,20 @@
+{
+  "name": "postgres-readonly-mcp",
+  "version": "1.0.0",
+  "description": "Read-only Postgres MCP (prod/stag)",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "libpg-query": "^17.7.4",
+    "pg": "^8.23.0",
+    "pg-cursor": "^2.22.0",
+    "zod": "^4.4.3"
+  }
+}

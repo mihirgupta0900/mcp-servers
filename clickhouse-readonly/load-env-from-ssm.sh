@@ -68,6 +68,20 @@ STAG_PASS="$(get "$SSM_STAG_RO_BASE/$SSM_STAG_PASS_KEY")"
 PROD_PORT="${CLICKHOUSE_PROD_PORT:-8443}"; PROD_SECURE="${CLICKHOUSE_PROD_SECURE:-1}"
 STAG_PORT="${CLICKHOUSE_STAG_PORT:-8443}"; STAG_SECURE="${CLICKHOUSE_STAG_SECURE:-1}"
 
+# Node's .env parser cuts an unquoted value at "#", so quote every value with a
+# quote character it does not contain. Single and backtick quotes are literal.
+q() {
+  local v="$1"
+  if [[ "$v" != *"'"* ]]; then printf "'%s'" "$v"
+  elif [[ "$v" != *'`'* ]]; then printf '`%s`' "$v"
+  elif [[ "$v" != *'"'* && "$v" != *'\\'* ]]; then printf '"%s"' "$v"
+  else echo "value contains every quote character; set it by hand" >&2; exit 1
+  fi
+}
+
+# A heredoc ignores a failed $(q ...), so check every value first.
+for v in "$PROD_HOST" "$PROD_DB" "$PROD_USER" "$PROD_PASS" "$STAG_HOST" "$STAG_DB" "$STAG_USER" "$STAG_PASS"; do q "$v" >/dev/null; done
+
 umask 077
 cat > "$ENV_FILE" <<EOF
 # clickhouse-readonly credentials
@@ -75,29 +89,28 @@ cat > "$ENV_FILE" <<EOF
 # prod: \$SSM_PROD_RO_BASE/{$SSM_PROD_USER_KEY,$SSM_PROD_PASS_KEY}
 # stag: \$SSM_STAG_RO_BASE/{$SSM_STAG_USER_KEY,$SSM_STAG_PASS_KEY}
 #
-# WARNING: values are unquoted and may contain shell metacharacters. server.js
-# reads this with Node's process.loadEnvFile(), which handles that correctly.
-# Do NOT source this file from a shell -- that will misparse the passwords.
+# Values are quoted for Node's process.loadEnvFile(), which server.js uses.
+# Do NOT source this file from a shell -- that may misparse the passwords.
 
-CLICKHOUSE_PROD_HOST=$PROD_HOST
+CLICKHOUSE_PROD_HOST=$(q "$PROD_HOST")
 CLICKHOUSE_PROD_PORT=$PROD_PORT
 CLICKHOUSE_PROD_SECURE=$PROD_SECURE
-CLICKHOUSE_PROD_USER=$PROD_USER
-CLICKHOUSE_PROD_PASSWORD=$PROD_PASS
-CLICKHOUSE_PROD_DATABASE=$PROD_DB
+CLICKHOUSE_PROD_USER=$(q "$PROD_USER")
+CLICKHOUSE_PROD_PASSWORD=$(q "$PROD_PASS")
+CLICKHOUSE_PROD_DATABASE=$(q "$PROD_DB")
 
-CLICKHOUSE_STAG_HOST=$STAG_HOST
+CLICKHOUSE_STAG_HOST=$(q "$STAG_HOST")
 CLICKHOUSE_STAG_PORT=$STAG_PORT
 CLICKHOUSE_STAG_SECURE=$STAG_SECURE
-CLICKHOUSE_STAG_USER=$STAG_USER
-CLICKHOUSE_STAG_PASSWORD=$STAG_PASS
-CLICKHOUSE_STAG_DATABASE=$STAG_DB
+CLICKHOUSE_STAG_USER=$(q "$STAG_USER")
+CLICKHOUSE_STAG_PASSWORD=$(q "$STAG_PASS")
+CLICKHOUSE_STAG_DATABASE=$(q "$STAG_DB")
 EOF
 chmod 600 "$ENV_FILE"
 
 # Masked summary only: field set/missing, value lengths, and the derived TLS mode.
 report() { printf '  %-28s %s\n' "$1" "$([ -n "$2" ] && echo "set (${#2} chars)" || echo "MISSING")"; }
-echo "wrote $ENV_FILE ($(wc -l < "$ENV_FILE" | tr -d ' ') lines, mode $(stat -f '%Lp' "$ENV_FILE"))"
+echo "wrote $ENV_FILE ($(wc -l < "$ENV_FILE" | tr -d ' ') lines, mode $(stat -c '%a' "$ENV_FILE" 2>/dev/null || stat -f '%Lp' "$ENV_FILE"))"
 echo "prod:"
 report CLICKHOUSE_PROD_HOST "$PROD_HOST"
 report CLICKHOUSE_PROD_PORT "$PROD_PORT"

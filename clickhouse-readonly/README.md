@@ -1,16 +1,30 @@
 # clickhouse-readonly
 
 A strictly read-only MCP server that lets Claude inspect and query ClickHouse in
-**two environments at once** — `prod` and `stag`. Sibling of
-`../postgres-readonly`, same shape, same guarantees.
+**two environments at once** — `prod` and `stag` — and in **any number of
+clusters per environment**. Sibling of `../postgres-readonly`, same shape, same
+guarantees.
 
 ## Tools
 
 | Tool | Arguments | Returns |
 | --- | --- | --- |
-| `list_databases` | `env` (`prod` \| `stag`) | databases with engine, table count, total rows, size |
-| `list_tables` | `env`, `database`, `include_views?`, `name_like?` | tables with engine, rows, size, **sorting key** and partition key |
-| `run_query` | `env`, `sql`, `database?`, `params?`, `limit?`, `timeout_ms?` | columns + types, rows, row count, elapsed ms, rows/bytes read, truncation flag |
+| `list_clusters` | `env?`, `probe?`, `table_like?` | each env's clusters: name, default flag, host, port, database; probed for reachability, version and table count; with `table_like`, the matching tables on each |
+| `list_databases` | `env` (`prod` \| `stag`), `cluster?` | databases with engine, table count, total rows, size |
+| `list_tables` | `env`, `cluster?`, `database`, `include_views?`, `name_like?` | tables with engine, rows, size, **sorting key** and partition key |
+| `run_query` | `env`, `cluster?`, `sql`, `database?`, `params?`, `limit?`, `timeout_ms?` | columns + types, rows, row count, elapsed ms, rows/bytes read, truncation flag |
+
+### Clusters
+
+An environment can be split over several ClickHouse clusters — separate
+services with their own hosts, credentials and data — so a given org's tables
+live on exactly one of them. Every tool takes an optional `cluster`; omitted,
+it is the environment's default cluster, so existing calls behave as before.
+Every result names the `env`, `cluster` and `host` it came from.
+
+`list_clusters` shows what is configured, never credentials. With
+`table_like: "acme_%"` it counts and samples the matching tables on every
+cluster, which is the quickest way to find where an org's data lives.
 
 `list_tables` returns the sorting and partition key on purpose: in ClickHouse
 those decide whether a query is fast or a full scan, so they matter before
@@ -50,6 +64,21 @@ Optional per environment: `..._SECURE` (default `1` → HTTPS, the ClickHouse
 Cloud setup; set `0` for plain HTTP), `..._PORT` (defaults to 8443 secure /
 8123 plain), `..._DATABASE` (default `default`), `..._TIMEOUT_MS`.
 See `.env.example`.
+
+That un-prefixed set is the environment's **default cluster**, named by
+`CLICKHOUSE_<ENV>_CLUSTER_NAME` (default `default`). Each further cluster gets
+its own prefixed set, `CLICKHOUSE_<ENV>_<CLUSTER>_HOST`, `_USER`, `_PASSWORD`
+and the same optional keys; the tools call it `<cluster>` in lower case.
+
+From SSM, `load-env-from-ssm.sh` writes the two default clusters and
+`add-cluster-from-ssm.sh` adds or refreshes one more without touching the rest:
+
+```
+./add-cluster-from-ssm.sh prod cluster_2 /myorg/prod/clickhouse/cluster_2
+```
+
+Both scripts quote every value: Node's `.env` parser cuts an unquoted value at
+`#`. Restart the MCP after changing `.env`.
 
 ## How read-only is enforced
 

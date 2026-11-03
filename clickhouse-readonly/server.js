@@ -6,12 +6,14 @@
  * postgres-readonly-mcp.
  *
  * Tools:
- *   - list_databases(env)
- *   - list_tables(env, database, ...)
- *   - run_query(env, sql, database?, ...)
+ *   - list_clusters(env?, probe?, table_like?)
+ *   - list_databases(env, cluster?)
+ *   - list_tables(env, cluster?, database, ...)
+ *   - run_query(env, cluster?, sql, database?, ...)
  *
- * `env` selects a connection profile: "prod" or "stag". Both are configured at
- * the same time via environment variables (see .env.example).
+ * `env` selects an environment, "prod" or "stag"; `cluster` selects one of its
+ * ClickHouse clusters (default: the env's default cluster). All are configured
+ * at the same time via environment variables (see .env.example).
  *
  * Read-only is enforced in four independent layers — see README.md. Note that
  * ClickHouse's own `readonly` setting is the authoritative one; the SQL guard
@@ -50,15 +52,82 @@ if (fs.existsSync(ENV_FILE)) {
 
 const ENVIRONMENTS = ["prod", "stag"];
 
-function profileFor(env) {
-  const P = `CLICKHOUSE_${env.toUpperCase()}_`;
+/**
+ * An environment can hold several ClickHouse clusters (separate services, each
+ * with its own host and credentials). Each is configured with its own prefix:
+ *
+ *   CLICKHOUSE_<ENV>_<CLUSTER>_HOST, ..._USER, ..._PASSWORD, ...
+ *
+ * The un-prefixed CLICKHOUSE_<ENV>_HOST set is the environment's default
+ * cluster, named by CLICKHOUSE_<ENV>_CLUSTER_NAME (default "default"), so an
+ * existing two-environment .env keeps working unchanged.
+ */
+const CLUSTER_NAME_RE = /^[a-z0-9][a-z0-9_]*$/;
+
+function defaultClusterName(env) {
+  return (process.env[`CLICKHOUSE_${env.toUpperCase()}_CLUSTER_NAME`] || "default").toLowerCase();
+}
+
+/** Every cluster configured for `env`, default first. */
+export function clusterNamesFor(env) {
+  const E = env.toUpperCase();
+  const re = new RegExp(`^CLICKHOUSE_${E}_(.+)_HOST$`);
+  const named = new Set();
+  for (const key of Object.keys(process.env)) {
+    const m = re.exec(key);
+    if (m && process.env[key]) named.add(m[1].toLowerCase());
+  }
+  const names = [...named].filter((n) => CLUSTER_NAME_RE.test(n)).sort();
+  const def = defaultClusterName(env);
+  if (process.env[`CLICKHOUSE_${E}_HOST`] || named.has(def)) {
+    return [def, ...names.filter((n) => n !== def)];
+  }
+  return names;
+}
+
+/** The env var prefix for one cluster of an environment. */
+function prefixFor(env, cluster) {
+  const E = env.toUpperCase();
+  const prefixed = `CLICKHOUSE_${E}_${cluster.toUpperCase()}_`;
+  // A cluster's own prefixed set wins; the default cluster falls back to the
+  // un-prefixed set.
+  if (process.env[`${prefixed}HOST`]) return prefixed;
+  if (cluster === defaultClusterName(env) && process.env[`CLICKHOUSE_${E}_HOST`]) {
+    return `CLICKHOUSE_${E}_`;
+  }
+  return prefixed;
+}
+
+/** Picks the cluster a call targets: the one asked for, else the default. */
+function resolveCluster(env, cluster) {
+  const names = clusterNamesFor(env);
+  if (names.length === 0) {
+    throw new Error(
+      `Environment "${env}" has no ClickHouse cluster configured — set CLICKHOUSE_${env.toUpperCase()}_HOST ` +
+        `or CLICKHOUSE_${env.toUpperCase()}_<CLUSTER>_HOST in ${ENV_FILE} (see .env.example).`,
+    );
+  }
+  const name = (cluster ?? defaultClusterName(env)).toLowerCase();
+  if (names.includes(name)) return name;
+  if (cluster === undefined && names.length === 1) return names[0];
+  throw new Error(
+    cluster === undefined
+      ? `Environment "${env}" has no default cluster; pass \`cluster\`. Configured: ${names.join(", ")}.`
+      : `Cluster "${name}" is not configured for ${env}. Configured: ${names.join(", ")}. ` +
+          `Call list_clusters to see them.`,
+  );
+}
+
+function profileFor(env, clusterArg) {
+  const cluster = resolveCluster(env, clusterArg);
+  const P = prefixFor(env, cluster);
   const host = process.env[`${P}HOST`];
   const username = process.env[`${P}USER`] ?? process.env[`${P}USERNAME`] ?? "default";
   const password = process.env[`${P}PASSWORD`] ?? "";
 
   if (!host) {
     throw new Error(
-      `Environment "${env}" is not configured — missing ${P}HOST. ` +
+      `Cluster "${cluster}" of "${env}" is not configured — missing ${P}HOST. ` +
         `Set it in ${ENV_FILE} (see .env.example).`,
     );
   }
@@ -72,6 +141,9 @@ function profileFor(env) {
   }
 
   return {
+    env,
+    cluster,
+    isDefault: cluster === defaultClusterName(env),
     url: `${protocol}://${host}:${port}`,
     host,
     port,
@@ -270,10 +342,13 @@ const settingsAccepted = new Map();
 
 const SETTING_REJECTED = /Cannot modify '([^']+)' setting in readonly mode/i;
 
-function readOnlySettings(env, { limit, timeoutMs }) {
+/** Settings strictness differs per server, so it is cached per cluster. */
+const profileKey = (profile) => `${profile.env}/${profile.cluster}`;
+
+function readOnlySettings(key, { limit, timeoutMs }) {
   // readonly=1 itself is always accepted: ClickHouse allows raising the
   // restriction, only lowering it is refused.
-  if (settingsAccepted.get(env) === false) return { readonly: 1 };
+  if (settingsAccepted.get(key) === false) return { readonly: 1 };
   return {
     readonly: 1,
     // NOTE: never send `allow_ddl`. On some versions it is protected and
@@ -294,22 +369,24 @@ function readOnlySettings(env, { limit, timeoutMs }) {
  * records that for this environment and retries once with readonly only. Row
  * and time limits are still enforced client-side, so degrading here is safe.
  */
-async function withSettingsFallback(env, attempt) {
+async function withSettingsFallback(key, attempt) {
   try {
     return await attempt();
   } catch (err) {
     const m = SETTING_REJECTED.exec(err?.message ?? "");
-    if (m && settingsAccepted.get(env) !== false) {
-      settingsAccepted.set(env, false);
+    if (m && settingsAccepted.get(key) !== false) {
+      settingsAccepted.set(key, false);
       return await attempt();
     }
     throw err;
   }
 }
 
-function withClient(env, database, fn, { limit = MAX_LIMIT, timeoutMs } = {}) {
-  return withSettingsFallback(env, async () => {
-    const profile = profileFor(env);
+/** `target` is `{ env, cluster? }`; an omitted cluster means the env's default. */
+function withClient(target, database, fn, { limit = MAX_LIMIT, timeoutMs } = {}) {
+  const profile = profileFor(target.env, target.cluster);
+  const key = profileKey(profile);
+  return withSettingsFallback(key, async () => {
     const client = createClient({
       url: profile.url,
       username: profile.username,
@@ -317,7 +394,7 @@ function withClient(env, database, fn, { limit = MAX_LIMIT, timeoutMs } = {}) {
       database: database ?? profile.database,
       request_timeout: timeoutMs ?? profile.requestTimeoutMs,
       application: "clickhouse-readonly-mcp",
-      clickhouse_settings: readOnlySettings(env, {
+      clickhouse_settings: readOnlySettings(key, {
         limit,
         timeoutMs: timeoutMs ?? profile.requestTimeoutMs,
       }),
@@ -344,15 +421,121 @@ const server = new McpServer(
   { name: "clickhouse-readonly-mcp", version: "1.0.0" },
   {
     instructions:
-      "Read-only ClickHouse access for the 'prod' and 'stag' environments. Every tool takes an " +
-      "`env` parameter that selects which server to query. This server cannot write, modify, or " +
-      "delete anything.",
+      "Read-only ClickHouse access for the 'prod' and 'stag' environments. An environment can " +
+      "hold several ClickHouse clusters, each a separate server with its own data: an org's tables " +
+      "live on exactly one of them. Every tool takes `env` and an optional `cluster` (default: the " +
+      "env's default cluster). Call list_clusters to see the clusters, and pass `table_like` to it " +
+      "to find which cluster holds a table. This server cannot write, modify, or delete anything.",
   },
 );
 
 const envSchema = z
   .enum(ENVIRONMENTS)
   .describe("Which configured ClickHouse environment to query: 'prod' or 'stag'.");
+
+const clusterSchema = z
+  .string()
+  .regex(CLUSTER_NAME_RE, "lowercase letters, digits and underscores")
+  .optional()
+  .describe(
+    "Which ClickHouse cluster of the environment to query, as named by list_clusters " +
+      "(e.g. 'cluster_2'). Omit for the environment's default cluster.",
+  );
+
+const where = (profile) => ({ env: profile.env, cluster: profile.cluster, host: profile.host });
+
+server.registerTool(
+  "list_clusters",
+  {
+    title: "List clusters",
+    description:
+      "List the ClickHouse clusters configured for each environment: name, whether it is the " +
+      "default, host, port and default database (never credentials). By default each cluster is " +
+      "probed for reachability, server version and table count. Pass `table_like` to also count " +
+      "and sample the tables matching a SQL LIKE pattern on each cluster, e.g. 'acme_%' to find " +
+      "which cluster holds an org's tables. Read-only.",
+    inputSchema: {
+      env: envSchema.optional().describe("Only this environment. Default: all environments."),
+      probe: z
+        .boolean()
+        .optional()
+        .describe("Connect to each cluster to check it and count tables. Default true."),
+      table_like: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("SQL LIKE pattern over table names, matched on every cluster (implies probe)."),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
+  },
+  async ({ env, probe = true, table_like }) => {
+    try {
+      const envs = env ? [env] : ENVIRONMENTS;
+      const targets = envs.flatMap((e) => clusterNamesFor(e).map((cluster) => ({ env: e, cluster })));
+      const clusters = await Promise.all(
+        targets.map(async (target) => {
+          let profile;
+          try {
+            profile = profileFor(target.env, target.cluster);
+          } catch (err) {
+            return { ...target, configured: false, error: err.message };
+          }
+          const base = {
+            env: profile.env,
+            cluster: profile.cluster,
+            default: profile.isDefault,
+            host: profile.host,
+            port: profile.port,
+            database: profile.database,
+          };
+          if (!probe && !table_like) return base;
+          try {
+            const info = await withClient(
+              target,
+              undefined,
+              async (client) => {
+                const res = await catalogQuery(
+                  client,
+                  `SELECT version() AS version,
+                          (SELECT count() FROM system.tables
+                           WHERE database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema'))
+                            AS tables,
+                          (SELECT count() FROM system.tables
+                           WHERE {pattern:String} != '' AND name LIKE {pattern:String}) AS matching,
+                          (SELECT groupArray(10)(concat(database, '.', name)) FROM
+                             (SELECT database, name FROM system.tables
+                              WHERE {pattern:String} != '' AND name LIKE {pattern:String}
+                              ORDER BY database, name)) AS sample`,
+                  { pattern: table_like ?? "" },
+                );
+                return res.data[0];
+              },
+              { limit: 10, timeoutMs: 15000 },
+            );
+            return {
+              ...base,
+              reachable: true,
+              version: info.version,
+              tables: Number(info.tables),
+              ...(table_like
+                ? { tables_matching: Number(info.matching), matching_sample: info.sample }
+                : {}),
+            };
+          } catch (err) {
+            return { ...base, reachable: false, error: String(err?.message ?? err).slice(0, 300) };
+          }
+        }),
+      );
+      return ok({
+        ...(table_like ? { table_like } : {}),
+        count: clusters.length,
+        clusters,
+      });
+    } catch (err) {
+      return fail(err);
+    }
+  },
+);
 
 function ok(payload) {
   return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
@@ -377,14 +560,14 @@ server.registerTool(
   {
     title: "List databases",
     description:
-      "List all databases on the selected ClickHouse environment (prod or stag), with engine, " +
-      "table count, total rows and on-disk size. Read-only.",
-    inputSchema: { env: envSchema },
+      "List all databases on the selected ClickHouse environment (prod or stag) and cluster, " +
+      "with engine, table count, total rows and on-disk size. Read-only.",
+    inputSchema: { env: envSchema, cluster: clusterSchema },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
   },
-  async ({ env }) => {
+  async ({ env, cluster }) => {
     try {
-      const out = await withClient(env, undefined, async (client, profile) => {
+      const out = await withClient({ env, cluster }, undefined, async (client, profile) => {
         const res = await catalogQuery(
           client,
           `SELECT d.name AS name,
@@ -397,9 +580,9 @@ server.registerTool(
            GROUP BY d.name, d.engine
            ORDER BY d.name`,
         );
-        return { host: profile.host, port: profile.port, databases: res.data };
+        return { where: where(profile), port: profile.port, databases: res.data };
       });
-      return ok({ env, host: out.host, port: out.port, count: out.databases.length, databases: out.databases });
+      return ok({ ...out.where, port: out.port, count: out.databases.length, databases: out.databases });
     } catch (err) {
       return fail(err);
     }
@@ -411,11 +594,12 @@ server.registerTool(
   {
     title: "List tables",
     description:
-      "List tables in a database on the selected ClickHouse environment (prod or stag), with " +
+      "List tables in a database on the selected ClickHouse environment (prod or stag) and cluster, with " +
       "engine, row count, size and sorting key. The sorting key matters for writing efficient " +
       "queries. Read-only.",
     inputSchema: {
       env: envSchema,
+      cluster: clusterSchema,
       database: z.string().min(1).describe("Database name, as returned by list_databases."),
       include_views: z.boolean().optional().describe("Include views and materialized views. Default false."),
       name_like: z
@@ -426,9 +610,9 @@ server.registerTool(
     },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
   },
-  async ({ env, database, include_views = false, name_like }) => {
+  async ({ env, cluster, database, include_views = false, name_like }) => {
     try {
-      const out = await withClient(env, undefined, async (client, profile) => {
+      const out = await withClient({ env, cluster }, undefined, async (client, profile) => {
         const res = await catalogQuery(
           client,
           `SELECT name,
@@ -444,25 +628,27 @@ server.registerTool(
            ORDER BY total_bytes DESC, name`,
           { db: database, views: include_views ? 1 : 0, pattern: name_like ?? "" },
         );
-        return { host: profile.host, tables: res.data };
+        return { where: where(profile), tables: res.data };
       });
 
       if (out.tables.length === 0) {
         // Distinguish "empty database" from "no such database".
-        const dbs = await withClient(env, undefined, async (client) => {
+        const dbs = await withClient({ env, cluster }, undefined, async (client) => {
           const res = await catalogQuery(client, "SELECT name FROM system.databases ORDER BY name");
           return res.data.map((r) => r.name);
         });
         if (!dbs.includes(database)) {
           return fail(
-            new Error(`Database "${database}" does not exist on ${env}. Available: ${dbs.join(", ")}`),
+            new Error(
+              `Database "${database}" does not exist on ${out.where.env}/${out.where.cluster}. ` +
+                `Available: ${dbs.join(", ")}`,
+            ),
           );
         }
       }
 
       return ok({
-        env,
-        host: out.host,
+        ...out.where,
         database,
         ...(name_like ? { name_like } : {}),
         count: out.tables.length,
@@ -480,12 +666,13 @@ server.registerTool(
     title: "Run a read-only query",
     description:
       "Run a single read-only SQL query (SELECT / WITH / SHOW / DESCRIBE / EXPLAIN / EXISTS) " +
-      "against the selected ClickHouse environment (prod or stag). The statement is validated " +
+      "against the selected ClickHouse environment (prod or stag) and cluster. The statement is validated " +
       "and executed with ClickHouse's readonly mode enabled, so writes and DDL are impossible. " +
       "Prefer {name:Type} placeholders with `params` over inlining values. Results are capped " +
       "by `limit`; the response says when rows were truncated.",
     inputSchema: {
       env: envSchema,
+      cluster: clusterSchema,
       sql: z
         .string()
         .min(1)
@@ -518,7 +705,7 @@ server.registerTool(
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
-  async ({ env, sql, database, params, limit = DEFAULT_LIMIT, timeout_ms = 30000 }) => {
+  async ({ env, cluster, sql, database, params, limit = DEFAULT_LIMIT, timeout_ms = 30000 }) => {
     try {
       assertReadOnlySql(sql);
 
@@ -535,7 +722,7 @@ server.registerTool(
 
       const started = Date.now();
       const out = await withClient(
-        env,
+        { env, cluster },
         database,
         async (client, profile) => {
           // Streamed, and abandoned as soon as one row past the limit arrives.
@@ -547,7 +734,7 @@ server.registerTool(
             query_params: params,
             format: "JSONCompactEachRowWithNamesAndTypes",
             abort_signal: AbortSignal.timeout(timeout_ms),
-            clickhouse_settings: readOnlySettings(env, { limit, timeoutMs: timeout_ms }),
+            clickhouse_settings: readOnlySettings(profileKey(profile), { limit, timeoutMs: timeout_ms }),
           });
 
           let names = null;
@@ -573,7 +760,7 @@ server.registerTool(
             types: types ?? [],
             rows,
             summary: rs.response_headers?.["x-clickhouse-summary"],
-            host: profile.host,
+            where: where(profile),
             database: database ?? profile.database,
           };
         },
@@ -594,7 +781,7 @@ server.registerTool(
       }
 
       return ok({
-        env,
+        ...out.where,
         database: out.database,
         row_count: out.rows.length,
         ...(truncated

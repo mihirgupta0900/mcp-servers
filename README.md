@@ -1,19 +1,20 @@
 # mcp-servers
 
-Two strictly read-only [MCP](https://modelcontextprotocol.io) servers that let
+Three strictly read-only [MCP](https://modelcontextprotocol.io) servers that let
 Claude inspect and query databases directly.
 
 | Server | Database | Tools |
 |---|---|---|
 | [`postgres-readonly`](postgres-readonly) | PostgreSQL | `list_databases`, `list_tables`, `run_query` |
-| [`clickhouse-readonly`](clickhouse-readonly) | ClickHouse | `list_databases`, `list_tables`, `run_query` |
+| [`clickhouse-readonly`](clickhouse-readonly) | ClickHouse | `list_clusters`, `list_databases`, `list_tables`, `run_query` |
+| [`mongo-readonly`](mongo-readonly) | MongoDB | `list_databases`, `list_collections`, `describe_collection`, `find`, `aggregate`, `count_documents` |
 
 Each has its own README with the full tool surface and safety notes.
 
 ## Shared conventions
 
-Both servers were built to the same shape, so what you learn from one carries
-over to the other.
+All three servers were built to the same shape, so what you learn from one
+carries over to the others.
 
 **Two environments at once.** Each server connects to both `prod` and `stag`.
 Every tool takes an `env` parameter selecting which one to hit, rather than
@@ -22,10 +23,10 @@ running two server instances with separate configs.
 **Read-only, enforced server-side.** The servers reject anything that isn't a
 read. That is the first line of defence, not the only one — point them at a
 database user that is itself read-only (`SELECT`-only grants on Postgres, a
-`READONLY` profile on ClickHouse). See each README for specifics.
+`READONLY` profile on ClickHouse, the `read` role on MongoDB). See each README for specifics.
 
 **Credentials live in `.env`, never in the repo.** Each server reads a local
-`.env` alongside its `server.js`. Both are gitignored. Copy `.env.example` and
+`.env` alongside its `server.js`. All are gitignored. Copy `.env.example` and
 fill it in:
 
 ```bash
@@ -47,7 +48,7 @@ node binary explicitly, then execs the server. Always register `run.sh`.
 git clone https://github.com/<you>/mcp-servers.git
 cd mcp-servers
 
-for d in postgres-readonly clickhouse-readonly; do (cd "$d" && npm install); done
+for d in postgres-readonly clickhouse-readonly mongo-readonly; do (cd "$d" && npm install); done
 ```
 
 Fill in each `.env`, then register the ones you want:
@@ -55,6 +56,7 @@ Fill in each `.env`, then register the ones you want:
 ```bash
 claude mcp add postgres-readonly --scope user -- /absolute/path/to/mcp-servers/postgres-readonly/run.sh
 claude mcp add clickhouse-readonly --scope user -- /absolute/path/to/mcp-servers/clickhouse-readonly/run.sh
+claude mcp add mongo-readonly --scope user -- /absolute/path/to/mcp-servers/mongo-readonly/run.sh
 ```
 
 User scope makes them available in every project. Verify with `claude mcp list`.
@@ -64,5 +66,5 @@ and wait on stdin, which is the MCP stdio transport. Ctrl-C to exit.
 
 ## Requirements
 
-Node 20.6+ (both servers use `process.loadEnvFile()`), and the AWS CLI only if
+Node 20.6+ (all servers use `process.loadEnvFile()`), and the AWS CLI only if
 you use the ClickHouse SSM helper.

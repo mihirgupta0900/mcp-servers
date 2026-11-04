@@ -1,0 +1,13 @@
+{
+  "name": "mongo-readonly-mcp",
+  "version": "1.0.0",
+  "description": "Read-only MongoDB MCP (prod/stag)",
+  "type": "module",
+  "private": true,
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "mongodb": "^7.8.0",
+    "zod": "^4.6.7"
+  }
+}
